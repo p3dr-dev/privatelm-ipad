@@ -1,0 +1,98 @@
+name: PrivateLM iOS 1.0.7-cluster
+
+on:
+ workflow_dispatch:
+
+permissions:
+ contents: read
+
+jobs:
+ build-ios:
+ runs-on: macos-15
+ timeout-minutes: 180
+ env:
+ DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+ CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+ defaults:
+ run:
+ shell: bash
+ working-directory: source
+ steps:
+ - name: Checkout exact upstream commit and submodules
+ uses: actions/checkout@v4
+ with:
+ repository: orailnoor/cross-platform-llm-client
+ ref: b12a87118c1c05ccc617539d1b9dbfe94dcfc99c
+ path: source
+ submodules: recursive
+ persist-credentials: false
+
+ - name: Verify source and tools
+ run: |
+ set -euo pipefail
+ test "$(git rev-parse HEAD)" = b12a87118c1c05ccc617539d1b9dbfe94dcfc99c
+ test "$(uname -m)" = arm64
+ xcodebuild -version
+ cmake --version
+ ninja --version
+ pod --version
+ git submodule status --recursive
+
+ - name: Install Flutter
+ uses: subosito/flutter-action@v2
+ with:
+ flutter-version: '3.38.4'
+ channel: stable
+ cache: false
+
+ - name: Prepare native llama cluster library
+ run: |
+ set -euo pipefail
+ bash local_plugins/llama_flutter_android/scripts/build_llama_ios.sh
+ test -s local_plugins/llama_flutter_android/ios/llama_ios/lib/libllama_ios.a
+
+ - name: Prepare local Stable Diffusion pod sources
+ run: |
+ set -euo pipefail
+ poddir="$PWD/local_plugins/sd_flutter_android/ios"
+ python3 -c 'import pathlib,re,sys; s=pathlib.Path(sys.argv[1]).read_text(); m=re.search(r"s\.prepare_command\s*=\s*<<-\x27CMD\x27\n(.*?)\n\s*CMD", s, re.S); assert m, "prepare_command not found"; pathlib.Path(sys.argv[2]).write_text(m.group(1)+"\n")' "$poddir/sd_flutter_android.podspec" "$RUNNER_TEMP/prepare_sd.sh"
+ (cd "$poddir" && bash "$RUNNER_TEMP/prepare_sd.sh")
+ test -f "$poddir/sd_cpp_src/include/stable-diffusion.h"
+ test -f "$poddir/sd_cpp_src/ggml/src/ggml-metal/ggml-metal-ios.metal"
+
+ - name: Resolve Flutter dependencies
+ run: |
+ set -euo pipefail
+ flutter --version
+ flutter config --enable-swift-package-manager
+ flutter pub get --enforce-lockfile
+
+ - name: Build release for iOS device without signing
+ run: |
+ set -euo pipefail
+ flutter build ios --release --no-codesign --no-pub
+ app=build/ios/iphoneos/Runner.app
+ test -d "$app"
+ test -f "$app/Runner"
+ lipo -info "$app/Runner"
+ /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$app/Info.plist"
+
+ - name: Package unsigned IPA
+ run: |
+ set -euo pipefail
+ mkdir -p "$RUNNER_TEMP/package/Payload"
+ ditto build/ios/iphoneos/Runner.app "$RUNNER_TEMP/package/Payload/Runner.app"
+ cd "$RUNNER_TEMP/package"
+ ditto -c -k --keepParent Payload "$GITHUB_WORKSPACE/PrivateLM-1.0.7-cluster-unsigned.ipa"
+ unzip -l "$GITHUB_WORKSPACE/PrivateLM-1.0.7-cluster-unsigned.ipa" | head -20 || true
+ shasum -a 256 "$GITHUB_WORKSPACE/PrivateLM-1.0.7-cluster-unsigned.ipa" > "$GITHUB_WORKSPACE/SHA256.txt"
+
+ - name: Upload unsigned IPA
+ uses: actions/upload-artifact@v4
+ with:
+ name: PrivateLM-1.0.7-cluster-unsigned
+ path: |
+ PrivateLM-1.0.7-cluster-unsigned.ipa
+ SHA256.txt
+ if-no-files-found: error
+ retention-days: 14
